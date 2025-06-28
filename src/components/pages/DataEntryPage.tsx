@@ -137,6 +137,12 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
   const [pincodeOpen, setPincodeOpen] = useState(false);
   const [selectedOda, setSelectedOda] = useState<string>('');
 
+  // Add new state for WFL boxes and 'same as vendor' option
+  const [wflWeightEntries, setWflWeightEntries] = useState<WeightEntry[]>([
+    { id: 'wfl-1', noOfPcs: 0, length: 0, breadth: 0, height: 0, actualWeight: 0 }
+  ]);
+  const [sameAsVendor, setSameAsVendor] = useState(false);
+
   // Fetch vendors and clients on mount
   useEffect(() => {
     const fetchData = async () => {
@@ -175,18 +181,28 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
   // Fetch client CFT multiplier when client is selected
   useEffect(() => {
     const fetchClientCftMultiplier = async () => {
-      if (!selectedClientId) return;
+      if (!selectedClientId || !formData.mode) return;
       try {
-        const { data, error } = await supabase.from('clients').select('cft_multiplier').eq('id', selectedClientId).single();
-        if (error) throw new Error(error.message || 'Failed to fetch client CFT multiplier');
-        setCftMultiplier(data?.cft_multiplier || 1);
+        // Map form mode to DB mode value
+        let modeForQuery = formData.mode;
+        if (formData.mode.toLowerCase() === 'surface') modeForQuery = 'sfc';
+        if (formData.mode.toLowerCase() === 'air') modeForQuery = 'air'; // add more mappings if needed
+        console.log('Fetching cft for:', { client_id: selectedClientId, mode: modeForQuery });
+        const { data: dataCft, error: errorCft } = await supabase
+          .from('client_rates')
+          .select('cft')
+          .eq('client_id', selectedClientId)
+          .eq('mode', modeForQuery)
+          .maybeSingle();
+        if (errorCft) throw new Error(errorCft.message || 'Failed to fetch client CFT');
+        setCftMultiplier(dataCft?.cft || 1);
       } catch (error) {
-        console.error('Error fetching client CFT multiplier:', error);
-        toast.error('Failed to fetch client CFT multiplier');
+        console.error('Error fetching client CFT:', error);
+        toast.error('Failed to fetch client CFT');
       }
     };
     fetchClientCftMultiplier();
-  }, [selectedClientId]);
+  }, [selectedClientId, formData.mode]);
 
   // Fetch all shipments on mount
   useEffect(() => {
@@ -302,57 +318,108 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
     }
   };
 
-  // Add this function to calculate volumetric weight
-  const calculateVolumetricWeight = (length: number, breadth: number, height: number) => {
-    return (length * breadth * height / 27000) * cftMultiplier;
+  // Update volumetric weight calculation for each box
+  // Calculate WFL volumetric weight
+  const calculateVolumetricWeightPerPiece = (length: number, breadth: number, height: number) => {
+    if (!formData.mode || !cftMultiplier) return 0;
+    const cft = cftMultiplier;
+    console.log('Volumetric Calculation:', { length, breadth, height, cft });
+    if (formData.mode.toLowerCase() === 'surface') {
+      return (length * breadth * height * cft) / 27000;
+    } else if (formData.mode.toLowerCase() === 'air') {
+      return (length * breadth * height * cft) / 5000;
+    }
+    return 0;
+  };
+
+  // Recalculate WFL box weights
+  const recalculateWflBoxWeights = (boxesToUse = wflWeightEntries) => {
+    const updatedBoxes = boxesToUse.map(box => {
+      const volumetricWeightPerPiece = calculateVolumetricWeightPerPiece(box.length, box.breadth, box.height);
+      return {
+        ...box,
+        volumetricWeightPerPiece,
+        totalVolumetricWeight: volumetricWeightPerPiece * box.noOfPcs
+      };
+    });
+    setWflWeightEntries(updatedBoxes);
+  };
+
+  // Handle WFL box input changes
+  const handleWflBoxChange = (id: string, field: keyof WeightEntry, value: string) => {
+    const updatedBoxes = wflWeightEntries.map(entry =>
+      entry.id === id
+        ? {
+            ...entry,
+            [field]: field === 'noOfPcs' ? parseInt(value) || 0 : parseFloat(value) || 0
+          }
+        : entry
+    );
+    setWflWeightEntries(updatedBoxes);
+    recalculateWflBoxWeights(updatedBoxes);
+  };
+
+  // Add/remove WFL box
+  const addWflBox = () => {
+    setWflWeightEntries([...wflWeightEntries, { id: `wfl-${Date.now()}`, noOfPcs: 0, length: 0, breadth: 0, height: 0, actualWeight: 0 }]);
+  };
+  const removeWflBox = (id: string) => {
+    if (wflWeightEntries.length > 1) {
+      setWflWeightEntries(wflWeightEntries.filter(entry => entry.id !== id));
+    }
+  };
+
+  // Handle 'Same as Vendor Weight' toggle
+  useEffect(() => {
+    if (sameAsVendor) {
+      // Copy vendor boxes to WFL and recalculate
+      const copied = weightEntries.map(box => ({ ...box, id: `wfl-${box.id}` }));
+      setWflWeightEntries(copied);
+      recalculateWflBoxWeights(copied);
+    }
+  }, [sameAsVendor, weightEntries, formData.mode, cftMultiplier]);
+
+  // Calculate totals for backend
+  const calculateTotal = (boxesArr: any[], field: string) => {
+    return boxesArr.reduce((sum, box) => sum + (box[field] * box.noOfPcs), 0);
+  };
+  const calculateTotalVolumetric = (boxesArr: any[]) => {
+    return boxesArr.reduce((sum, box) => sum + (box.totalVolumetricWeight || 0), 0);
   };
 
   // Update the handleSubmit function
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-
     try {
-      // Validate vendor pincode
-      if (!selectedVendorId || !formData.pinCode) {
-        throw new Error('Please select a vendor and enter a pincode');
-      }
-
-      const pincodeResponse = await fetch(
-        `http://localhost:4000/api/validate-pincode/${selectedVendorId}/${formData.pinCode}`
-      );
-
-      if (!pincodeResponse.ok) {
-        throw new Error('Invalid pincode for the selected vendor');
-      }
-
-      const pincodeData = await pincodeResponse.json();
-      
-      // Calculate volumetric weights for all boxes
+      // Vendor weights
       const calculatedWeightEntries = weightEntries.map(entry => {
-        const volumetricWeight = calculateVolumetricWeight(entry.length, entry.breadth, entry.height);
+        const volumetricWeightPerPiece = calculateVolumetricWeightPerPiece(entry.length, entry.breadth, entry.height);
         return {
           ...entry,
-          volumetricWeight,
-          totalVolumetricWeight: volumetricWeight * entry.noOfPcs
+          volumetricWeightPerPiece,
+          totalVolumetricWeight: volumetricWeightPerPiece * entry.noOfPcs
         };
       });
+      const vendorActualWeight = calculateTotal(calculatedWeightEntries, 'actualWeight');
+      const vendorVolumetricWeight = calculateTotalVolumetric(calculatedWeightEntries);
+      // WFL weights
+      const calculatedWflWeightEntries = wflWeightEntries.map(entry => {
+        const volumetricWeightPerPiece = calculateVolumetricWeightPerPiece(entry.length, entry.breadth, entry.height);
+        return {
+          ...entry,
+          volumetricWeightPerPiece,
+          totalVolumetricWeight: volumetricWeightPerPiece * entry.noOfPcs
+        };
+      });
+      const wflActualWeight = calculateTotal(calculatedWflWeightEntries, 'actualWeight');
+      const wflVolumetricWeight = calculateTotalVolumetric(calculatedWflWeightEntries);
 
-      // Calculate total weights
-      const totalActualWeight = calculatedWeightEntries.reduce(
-        (sum, entry) => sum + (entry.actualWeight * entry.noOfPcs), 
-        0
-      );
-      const totalVolumetricWeight = calculatedWeightEntries.reduce(
-        (sum, entry) => sum + entry.totalVolumetricWeight, 
-        0
-      );
-
-      // Prepare the shipment data according to the current table structure
+      // Prepare the shipment data
       const shipmentData = {
         user_id: user.id,
         client_id: selectedClientId,
-        vendor_id: selectedVendorId, // Using vendor_id instead of vendor_name
+        vendor_id: selectedVendorId,
         zone_id: null, // Add this if you have zone selection
         wfl_number: formData.wflAwb,
         vendor_awb_number: formData.vendorAwb,
@@ -363,75 +430,54 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
         consignee: formData.consignee,
         destination: formData.destination,
         pin_code: formData.pinCode,
-        total_box: calculatedWeightEntries.length,
-        actual_weight: totalActualWeight,
-        actual_volumetric_weight: totalVolumetricWeight,
-        wfl_weight: totalActualWeight,
-        wfl_volumetric_weight: totalVolumetricWeight,
-        oda: pincodeData.oda,
+        total_box: weightEntries.length,
+        actual_weight: vendorActualWeight,
+        actual_volumetric_weight: vendorVolumetricWeight,
+        wfl_weight: wflActualWeight,
+        wfl_volumetric_weight: wflVolumetricWeight,
+        oda: selectedOda,
         shipment_date: new Date().toISOString().split('T')[0],
-        boxes: calculatedWeightEntries.map(entry => ({
+      };
+
+      // Insert into shipments table
+      const { data: shipment, error: shipmentError } = await supabase
+        .from('shipments')
+        .insert([shipmentData])
+        .select()
+        .single();
+      if (shipmentError) throw shipmentError;
+
+      // Insert boxes into shipment_boxes table
+      const allBoxes = [
+        ...calculatedWeightEntries.map(entry => ({
+          shipment_id: shipment.id,
           number_of_pieces: entry.noOfPcs,
           length_cm: entry.length,
           breadth_cm: entry.breadth,
           height_cm: entry.height,
           actual_weight_per_piece: entry.actualWeight,
-          volumetric_weight_per_piece: entry.volumetricWeight,
+          volumetric_weight_per_piece: entry.volumetricWeightPerPiece,
+          total_volumetric_weight: entry.totalVolumetricWeight
+        })),
+        ...calculatedWflWeightEntries.map(entry => ({
+          shipment_id: shipment.id,
+          number_of_pieces: entry.noOfPcs,
+          length_cm: entry.length,
+          breadth_cm: entry.breadth,
+          height_cm: entry.height,
+          actual_weight_per_piece: entry.actualWeight,
+          volumetric_weight_per_piece: entry.volumetricWeightPerPiece,
           total_volumetric_weight: entry.totalVolumetricWeight
         }))
-      };
-
-      // Send the data to the backend
-      const response = await fetch('http://localhost:4000/api/shipments', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(shipmentData)
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to save shipment');
+      ];
+      if (allBoxes.length > 0) {
+        const { error: boxesError } = await supabase
+          .from('shipment_boxes')
+          .insert(allBoxes);
+        if (boxesError) throw boxesError;
       }
 
-      const savedShipment: SavedShipment = await response.json();
-
-      // Transform the saved shipment to match the expected structure
-      const transformedShipment: ShipmentEntry = {
-        id: savedShipment.id,
-        wflAwb: savedShipment.wfl_number,
-        vendorName: savedShipment.vendors.name,
-        vendorAwb: savedShipment.vendor_awb_number,
-        mode: savedShipment.mode,
-        invoiceNumber: '', // These fields are not in the table display
-        invoiceValue: '',
-        consignor: savedShipment.clients.client_name,
-        fromLocation: savedShipment.consignor_from_location,
-        consignee: savedShipment.consignee,
-        destination: savedShipment.destination,
-        pinCode: '', // These fields are not in the table display
-        oda: '',
-        weightEntries: savedShipment.shipment_boxes.map((box, idx) => ({
-          id: `${savedShipment.id}-box-${idx}`,
-          noOfPcs: box.number_of_pieces,
-          length: box.length_cm,
-          breadth: box.breadth_cm,
-          height: box.height_cm,
-          actualWeight: box.actual_weight_per_piece
-        })),
-        createdAt: savedShipment.created_at,
-        createdBy: user.name || user.email,
-        wfl_weight: (savedShipment as any).wfl_weight,
-        wfl_volumetric_weight: (savedShipment as any).wfl_volumetric_weight,
-        actual_weight: (savedShipment as any).actual_weight,
-        actual_volumetric_weight: (savedShipment as any).actual_volumetric_weight,
-      };
-
-      // Update local state with the transformed shipment
-      setShipmentEntries([transformedShipment, ...shipmentEntries]);
-      
-      // Reset form
+      // Reset form and show success
       setFormData({
         wflAwb: '',
         vendorName: '',
@@ -446,22 +492,13 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
         pinCode: '',
         oda: '',
       });
-      
-      setWeightEntries([{ 
-        id: Date.now().toString(), 
-        noOfPcs: 0, 
-        length: 0, 
-        breadth: 0, 
-        height: 0, 
-        actualWeight: 0 
-      }]);
-
+      setWeightEntries([{ id: Date.now().toString(), noOfPcs: 0, length: 0, breadth: 0, height: 0, actualWeight: 0 }]);
+      setWflWeightEntries([{ id: 'wfl-1', noOfPcs: 0, length: 0, breadth: 0, height: 0, actualWeight: 0 }]);
       setSelectedVendorId('');
       setSelectedClientId('');
       setValidPincodes([]);
       setCftMultiplier(1);
       setSelectedOda('');
-
       toast.success('Shipment saved successfully');
     } catch (error: any) {
       console.error('Error saving shipment:', error);
@@ -743,17 +780,7 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <h3 className="text-lg font-medium">Weight Entries</h3>
-                <Button
-                  type="button"
-                  onClick={addWeightEntry}
-                  variant="outline"
-                  size="sm"
-                >
-                  <Plus className="w-4 h-4 mr-2" />
-                  Add Box
-                </Button>
               </div>
-
               <div className="space-y-4">
                 {weightEntries.map((entry, index) => (
                   <div key={entry.id} className="grid grid-cols-1 md:grid-cols-6 gap-4 p-4 border rounded-lg">
@@ -763,7 +790,7 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
                         id={`pcs-${entry.id}`}
                         type="number"
                         value={entry.noOfPcs}
-                        onChange={(e) => handleWeightInputChange(entry.id, 'noOfPcs', e.target.value)}
+                        onChange={e => handleWeightInputChange(entry.id, 'noOfPcs', e.target.value)}
                         placeholder="Enter number of pieces"
                         required
                       />
@@ -774,7 +801,7 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
                         id={`length-${entry.id}`}
                         type="number"
                         value={entry.length}
-                        onChange={(e) => handleWeightInputChange(entry.id, 'length', e.target.value)}
+                        onChange={e => handleWeightInputChange(entry.id, 'length', e.target.value)}
                         placeholder="Enter length"
                         required
                       />
@@ -785,7 +812,7 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
                         id={`breadth-${entry.id}`}
                         type="number"
                         value={entry.breadth}
-                        onChange={(e) => handleWeightInputChange(entry.id, 'breadth', e.target.value)}
+                        onChange={e => handleWeightInputChange(entry.id, 'breadth', e.target.value)}
                         placeholder="Enter breadth"
                         required
                       />
@@ -796,7 +823,7 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
                         id={`height-${entry.id}`}
                         type="number"
                         value={entry.height}
-                        onChange={(e) => handleWeightInputChange(entry.id, 'height', e.target.value)}
+                        onChange={e => handleWeightInputChange(entry.id, 'height', e.target.value)}
                         placeholder="Enter height"
                         required
                       />
@@ -807,24 +834,140 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
                         id={`weight-${entry.id}`}
                         type="number"
                         value={entry.actualWeight}
-                        onChange={(e) => handleWeightInputChange(entry.id, 'actualWeight', e.target.value)}
+                        onChange={e => handleWeightInputChange(entry.id, 'actualWeight', e.target.value)}
                         placeholder="Enter actual weight"
                         required
                       />
                     </div>
-                    {index > 0 && (
-                      <div className="flex items-end">
+                    <div className="flex items-end gap-2">
+                      {index > 0 && (
                         <Button
                           type="button"
                           variant="destructive"
                           onClick={() => removeWeightEntry(entry.id)}
-                          className="w-full"
+                          className="w-8 h-8 p-0 flex items-center justify-center"
+                          title="Remove"
                         >
-                          <X className="w-4 h-4 mr-2" />
-                          Remove
+                          <X className="w-4 h-4" />
                         </Button>
-                      </div>
-                    )}
+                      )}
+                      <Button
+                        type="button"
+                        onClick={addWeightEntry}
+                        variant="outline"
+                        size="icon"
+                        className="w-8 h-8 p-0 flex items-center justify-center"
+                        title="Add Box"
+                      >
+                        <Plus className="w-4 h-4" />
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* WFL Weight Entries Section */}
+            <div className="space-y-4">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-lg font-medium">WFL Weight Entries</h3>
+                <label className="flex items-center text-base font-normal">
+                  <input
+                    type="checkbox"
+                    checked={sameAsVendor}
+                    onChange={e => setSameAsVendor(e.target.checked)}
+                    className="mr-2"
+                  />
+                  Weight is same as Vendor
+                </label>
+              </div>
+              <div className="space-y-4">
+                {wflWeightEntries.map((entry, index) => (
+                  <div key={entry.id} className="grid grid-cols-1 md:grid-cols-6 gap-4 p-4 border rounded-lg">
+                    <div>
+                      <Label htmlFor={`pcs-${entry.id}`}>No. of Pcs</Label>
+                      <Input
+                        id={`pcs-${entry.id}`}
+                        type="number"
+                        value={entry.noOfPcs}
+                        onChange={e => handleWflBoxChange(entry.id, 'noOfPcs', e.target.value)}
+                        placeholder="Enter number of pieces"
+                        required
+                        disabled={sameAsVendor}
+                      />
+                    </div>
+                    <div>
+                      <Label htmlFor={`length-${entry.id}`}>Length (cm)</Label>
+                      <Input
+                        id={`length-${entry.id}`}
+                        type="number"
+                        value={entry.length}
+                        onChange={e => handleWflBoxChange(entry.id, 'length', e.target.value)}
+                        placeholder="Enter length"
+                        required
+                        disabled={sameAsVendor}
+                      />
+                    </div>
+                    <div>
+                      <Label htmlFor={`breadth-${entry.id}`}>Breadth (cm)</Label>
+                      <Input
+                        id={`breadth-${entry.id}`}
+                        type="number"
+                        value={entry.breadth}
+                        onChange={e => handleWflBoxChange(entry.id, 'breadth', e.target.value)}
+                        placeholder="Enter breadth"
+                        required
+                        disabled={sameAsVendor}
+                      />
+                    </div>
+                    <div>
+                      <Label htmlFor={`height-${entry.id}`}>Height (cm)</Label>
+                      <Input
+                        id={`height-${entry.id}`}
+                        type="number"
+                        value={entry.height}
+                        onChange={e => handleWflBoxChange(entry.id, 'height', e.target.value)}
+                        placeholder="Enter height"
+                        required
+                        disabled={sameAsVendor}
+                      />
+                    </div>
+                    <div>
+                      <Label htmlFor={`weight-${entry.id}`}>Actual Weight (kg)</Label>
+                      <Input
+                        id={`weight-${entry.id}`}
+                        type="number"
+                        value={entry.actualWeight}
+                        onChange={e => handleWflBoxChange(entry.id, 'actualWeight', e.target.value)}
+                        placeholder="Enter actual weight"
+                        required
+                        disabled={sameAsVendor}
+                      />
+                    </div>
+                    <div className="flex items-end gap-2">
+                      {index > 0 && !sameAsVendor && (
+                        <Button
+                          type="button"
+                          variant="destructive"
+                          onClick={() => removeWflBox(entry.id)}
+                          className="w-8 h-8 p-0 flex items-center justify-center"
+                          title="Remove"
+                        >
+                          <X className="w-4 h-4" />
+                        </Button>
+                      )}
+                      <Button
+                        type="button"
+                        onClick={addWflBox}
+                        variant="outline"
+                        size="icon"
+                        className="w-8 h-8 p-0 flex items-center justify-center"
+                        disabled={sameAsVendor}
+                        title="Add Box"
+                      >
+                        <Plus className="w-4 h-4" />
+                      </Button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -860,77 +1003,6 @@ export function DataEntryPage({ user, onViewChange }: DataEntryPageProps) {
               </Button>
             </div>
           </form>
-        </CardContent>
-      </Card>
-
-      {/* All Entries Display */}
-      <Card className="glass-effect border-2">
-        <CardHeader>
-          <CardTitle className="flex items-center">
-            <Database className="w-5 h-5 mr-2 text-logistics-primary" />
-            All Shipment Entries
-          </CardTitle>
-          <CardDescription>
-            View all submitted shipment data
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {shipmentEntries.length === 0 ? (
-            <div className="text-center py-12">
-              <Database className="w-16 h-16 mx-auto text-muted-foreground mb-4" />
-              <h3 className="text-lg font-semibold mb-2">No entries found</h3>
-              <p className="text-muted-foreground">
-                Submit your first shipment entry using the form above
-              </p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>WFL AWB Number</TableHead>
-                    <TableHead>Vendor Name</TableHead>
-                    <TableHead>Vendor AWB Number</TableHead>
-                    <TableHead>Mode</TableHead>
-                    <TableHead>Invoice Number</TableHead>
-                    <TableHead>Invoice Value</TableHead>
-                    <TableHead>Consignor</TableHead>
-                    <TableHead>From Location</TableHead>
-                    <TableHead>Consignee</TableHead>
-                    <TableHead>Destination</TableHead>
-                    <TableHead>Pin Code</TableHead>
-                    <TableHead>ODA</TableHead>
-                    <TableHead>WFL Weight</TableHead>
-                    <TableHead>WFL Volumetric Weight</TableHead>
-                    <TableHead>Actual Weight</TableHead>
-                    <TableHead>Actual Volumetric Weight</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {shipmentEntries.map((entry) => (
-                    <TableRow key={entry.id}>
-                      <TableCell>{entry.wflAwb}</TableCell>
-                      <TableCell>{entry.vendorName}</TableCell>
-                      <TableCell>{entry.vendorAwb}</TableCell>
-                      <TableCell>{entry.mode}</TableCell>
-                      <TableCell>{entry.invoiceNumber}</TableCell>
-                      <TableCell>{entry.invoiceValue}</TableCell>
-                      <TableCell>{entry.consignor}</TableCell>
-                      <TableCell>{entry.fromLocation}</TableCell>
-                      <TableCell>{entry.consignee}</TableCell>
-                      <TableCell>{entry.destination}</TableCell>
-                      <TableCell>{entry.pinCode}</TableCell>
-                      <TableCell>{entry.oda}</TableCell>
-                      <TableCell>{entry.wfl_weight || '-'}</TableCell>
-                      <TableCell>{entry.wfl_volumetric_weight || '-'}</TableCell>
-                      <TableCell>{entry.actual_weight || '-'}</TableCell>
-                      <TableCell>{entry.actual_volumetric_weight || '-'}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          )}
         </CardContent>
       </Card>
     </div>

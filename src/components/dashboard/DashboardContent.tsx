@@ -33,7 +33,7 @@ export function DashboardContent({ user, activeView, onViewChange }: DashboardCo
       case 'all-shipments':
         return <AllShipmentsPage user={user} onViewChange={onViewChange} />;
       case 'billing':
-        return <BillingPage user={user} />;
+        return <BillingPage />;
       case 'rate-calculator':
         return <RateCalculatorPage user={user} />;
       case 'courier-management':

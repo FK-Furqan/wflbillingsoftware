@@ -58,6 +58,20 @@ const ShipmentEntryForm = () => {
     }
   ]);
 
+  // Add new state for WFL boxes and 'same as vendor' option
+  const [wflBoxes, setWflBoxes] = useState([
+    {
+      number_of_pieces: 1,
+      length_cm: 0,
+      breadth_cm: 0,
+      height_cm: 0,
+      actual_weight_per_piece: 0,
+      volumetric_weight_per_piece: 0,
+      total_volumetric_weight: 0
+    }
+  ]);
+  const [sameAsVendor, setSameAsVendor] = useState(false);
+
   // Fetch initial data
   useEffect(() => {
     const fetchInitialData = async () => {
@@ -171,6 +185,35 @@ const ShipmentEntryForm = () => {
     setBoxes(updatedBoxes);
   };
 
+  // Calculate WFL volumetric weight
+  const calculateWflVolumetricWeight = (length, breadth, height) => {
+    if (!formData.mode || !cftMultiplier) return 0;
+    const cft = cftMultiplier;
+    if (formData.mode.toLowerCase() === 'surface') {
+      return (length * breadth * height) / (27000 * cft);
+    } else if (formData.mode.toLowerCase() === 'air') {
+      return (length * breadth * height) / (5000 * cft);
+    }
+    return 0;
+  };
+
+  // Recalculate WFL box weights
+  const recalculateWflBoxWeights = (boxesToUse = wflBoxes) => {
+    const updatedBoxes = boxesToUse.map(box => {
+      const volumetricWeight = calculateWflVolumetricWeight(
+        box.length_cm,
+        box.breadth_cm,
+        box.height_cm
+      );
+      return {
+        ...box,
+        volumetric_weight_per_piece: volumetricWeight,
+        total_volumetric_weight: volumetricWeight * box.number_of_pieces
+      };
+    });
+    setWflBoxes(updatedBoxes);
+  };
+
   // Handle form input changes
   const handleInputChange = (e) => {
     const { name, value } = e.target;
@@ -220,6 +263,26 @@ const ShipmentEntryForm = () => {
     }));
   };
 
+  // Handle WFL box input changes
+  const handleWflBoxChange = (index, field, value) => {
+    const updatedBoxes = [...wflBoxes];
+    updatedBoxes[index] = {
+      ...updatedBoxes[index],
+      [field]: value
+    };
+    // Recalculate weights if dimensions or pieces change
+    if (["length_cm", "breadth_cm", "height_cm", "number_of_pieces"].includes(field)) {
+      const { length_cm, breadth_cm, height_cm, number_of_pieces } = updatedBoxes[index];
+      const volumetricWeight = calculateWflVolumetricWeight(length_cm, breadth_cm, height_cm);
+      updatedBoxes[index] = {
+        ...updatedBoxes[index],
+        volumetric_weight_per_piece: volumetricWeight,
+        total_volumetric_weight: volumetricWeight * number_of_pieces
+      };
+    }
+    setWflBoxes(updatedBoxes);
+  };
+
   // Add new box
   const addBox = () => {
     setBoxes([...boxes, {
@@ -243,9 +306,38 @@ const ShipmentEntryForm = () => {
     }));
   };
 
-  // Calculate total actual weight
-  const calculateTotalActualWeight = () => {
-    return boxes.reduce((sum, box) => sum + (box.actual_weight_per_piece * box.number_of_pieces), 0);
+  // Add/remove WFL box
+  const addWflBox = () => {
+    setWflBoxes([...wflBoxes, {
+      number_of_pieces: 1,
+      length_cm: 0,
+      breadth_cm: 0,
+      height_cm: 0,
+      actual_weight_per_piece: 0,
+      volumetric_weight_per_piece: 0,
+      total_volumetric_weight: 0
+    }]);
+  };
+  const removeWflBox = (index) => {
+    const updatedBoxes = wflBoxes.filter((_, i) => i !== index);
+    setWflBoxes(updatedBoxes);
+  };
+
+  // Handle 'Same as Vendor Weight' toggle
+  useEffect(() => {
+    if (sameAsVendor) {
+      // Copy vendor boxes to WFL and recalculate
+      const copied = boxes.map(box => ({ ...box }));
+      recalculateWflBoxWeights(copied);
+    }
+  }, [sameAsVendor, boxes, formData.mode, cftMultiplier]);
+
+  // Calculate totals for backend
+  const calculateTotal = (boxesArr, field) => {
+    return boxesArr.reduce((sum, box) => sum + (box[field] * box.number_of_pieces), 0);
+  };
+  const calculateTotalVolumetric = (boxesArr) => {
+    return boxesArr.reduce((sum, box) => sum + box.total_volumetric_weight, 0);
   };
 
   // Handle form submission
@@ -253,11 +345,13 @@ const ShipmentEntryForm = () => {
     e.preventDefault();
     setLoading(true);
     setError(null);
-
     try {
-      // Calculate total actual weight
-      const totalActualWeight = calculateTotalActualWeight();
-
+      // Vendor weights
+      const vendorActualWeight = calculateTotal(boxes, 'actual_weight_per_piece');
+      const vendorVolumetricWeight = calculateTotalVolumetric(boxes);
+      // WFL weights
+      const wflActualWeight = calculateTotal(wflBoxes, 'actual_weight_per_piece');
+      const wflVolumetricWeight = calculateTotalVolumetric(wflBoxes);
       const response = await fetch('http://localhost:4000/api/shipments', {
         method: 'POST',
         headers: {
@@ -265,8 +359,18 @@ const ShipmentEntryForm = () => {
         },
         body: JSON.stringify({
           ...formData,
-          actual_weight: totalActualWeight,
+          actual_weight: vendorActualWeight,
+          actual_volumetric_weight: vendorVolumetricWeight,
+          wfl_weight: wflActualWeight,
+          wfl_volumetric_weight: wflVolumetricWeight,
           boxes: boxes.map(box => ({
+            number_of_pieces: box.number_of_pieces,
+            length_cm: box.length_cm,
+            breadth_cm: box.breadth_cm,
+            height_cm: box.height_cm,
+            actual_weight_per_piece: box.actual_weight_per_piece
+          })),
+          wfl_boxes: wflBoxes.map(box => ({
             number_of_pieces: box.number_of_pieces,
             length_cm: box.length_cm,
             breadth_cm: box.breadth_cm,
@@ -275,15 +379,12 @@ const ShipmentEntryForm = () => {
           }))
         })
       });
-
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.error || 'Error saving shipment');
       }
-
       const result = await response.json();
-      // Show success message or redirect
-      navigate('/shipments'); // Redirect to shipments list
+      navigate('/shipments');
     } catch (error) {
       setError(error.message);
     } finally {
@@ -496,10 +597,10 @@ const ShipmentEntryForm = () => {
             />
           </Grid>
 
-          {/* Boxes Section */}
+          {/* Vendor Boxes Section */}
           <Grid item xs={12}>
             <Typography variant="h6" gutterBottom>
-              Boxes
+              Vendor Weight Entries
             </Typography>
             {boxes.map((box, index) => (
               <Paper key={index} elevation={1} sx={{ p: 2, mb: 2 }}>
@@ -607,6 +708,134 @@ const ShipmentEntryForm = () => {
               onClick={addBox}
               variant="outlined"
               sx={{ mt: 2 }}
+            >
+              Add Box
+            </Button>
+          </Grid>
+
+          {/* WFL Boxes Section */}
+          <Grid item xs={12}>
+            <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
+              <Typography variant="h6" gutterBottom sx={{ mr: 2 }}>
+                WFL Weight Entries
+              </Typography>
+              <label style={{ display: 'flex', alignItems: 'center', fontWeight: 400, fontSize: 16 }}>
+                <input
+                  type="checkbox"
+                  checked={sameAsVendor}
+                  onChange={e => setSameAsVendor(e.target.checked)}
+                  style={{ marginRight: 8 }}
+                />
+                Same as Vendor Weight
+              </label>
+            </Box>
+            {wflBoxes.map((box, index) => (
+              <Paper key={index} elevation={1} sx={{ p: 2, mb: 2 }}>
+                <Grid container spacing={2} alignItems="center">
+                  <Grid item xs={12}>
+                    <Typography variant="subtitle1">
+                      Box {index + 1}
+                    </Typography>
+                  </Grid>
+                  
+                  <Grid item xs={12} sm={6} md={2}>
+                    <TextField
+                      fullWidth
+                      label="Number of Pieces"
+                      type="number"
+                      value={box.number_of_pieces}
+                      onChange={(e) => handleWflBoxChange(index, 'number_of_pieces', Number(e.target.value))}
+                      required
+                      inputProps={{ min: 1 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} sm={6} md={2}>
+                    <TextField
+                      fullWidth
+                      label="Length (cm)"
+                      type="number"
+                      value={box.length_cm}
+                      onChange={(e) => handleWflBoxChange(index, 'length_cm', Number(e.target.value))}
+                      required
+                      inputProps={{ min: 0, step: 0.01 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} sm={6} md={2}>
+                    <TextField
+                      fullWidth
+                      label="Breadth (cm)"
+                      type="number"
+                      value={box.breadth_cm}
+                      onChange={(e) => handleWflBoxChange(index, 'breadth_cm', Number(e.target.value))}
+                      required
+                      inputProps={{ min: 0, step: 0.01 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} sm={6} md={2}>
+                    <TextField
+                      fullWidth
+                      label="Height (cm)"
+                      type="number"
+                      value={box.height_cm}
+                      onChange={(e) => handleWflBoxChange(index, 'height_cm', Number(e.target.value))}
+                      required
+                      inputProps={{ min: 0, step: 0.01 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} sm={6} md={2}>
+                    <TextField
+                      fullWidth
+                      label="Weight per Piece (kg)"
+                      type="number"
+                      value={box.actual_weight_per_piece}
+                      onChange={(e) => handleWflBoxChange(index, 'actual_weight_per_piece', Number(e.target.value))}
+                      required
+                      inputProps={{ min: 0, step: 0.01 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} sm={6} md={2}>
+                    <Box sx={{ display: 'flex', flexDirection: 'column' }}>
+                      <Typography variant="caption" color="textSecondary">
+                        Volumetric Weight per Piece
+                      </Typography>
+                      <Typography variant="body2">
+                        {box.volumetric_weight_per_piece.toFixed(2)} kg
+                      </Typography>
+                      <Typography variant="caption" color="textSecondary">
+                        Total Volumetric Weight
+                      </Typography>
+                      <Typography variant="body2">
+                        {box.total_volumetric_weight.toFixed(2)} kg
+                      </Typography>
+                    </Box>
+                  </Grid>
+
+                  {wflBoxes.length > 1 && (
+                    <Grid item xs={12} sm={6} md={1}>
+                      <IconButton
+                        color="error"
+                        onClick={() => removeWflBox(index)}
+                        size="small"
+                      >
+                        <DeleteIcon />
+                      </IconButton>
+                    </Grid>
+                  )}
+                </Grid>
+              </Paper>
+            ))}
+
+            <Button
+              startIcon={<AddIcon />}
+              onClick={addWflBox}
+              variant="outlined"
+              sx={{ mt: 2 }}
+              disabled={sameAsVendor}
             >
               Add Box
             </Button>

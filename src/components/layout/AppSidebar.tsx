@@ -68,11 +68,6 @@ const adminMenuItems = [
     id: 'rate-master' as ActiveView,
   },
   {
-    title: 'Courier',
-    icon: Truck,
-    id: 'courier-management' as ActiveView,
-  },
-  {
     title: 'Data Entry',
     icon: Database,
     id: 'data-entry' as ActiveView,
@@ -81,11 +76,6 @@ const adminMenuItems = [
     title: 'All Shipments',
     icon: Database,
     id: 'all-shipments' as ActiveView,
-  },
-  {
-    title: 'Invoice',
-    icon: Receipt,
-    id: 'invoice' as ActiveView,
   },
   {
     title: 'Billing',
